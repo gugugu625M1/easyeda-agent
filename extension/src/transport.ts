@@ -34,6 +34,7 @@ import { ActionQueue, isBypassAction } from './action-queue';
 import { sweepDeadlines } from './deadlines';
 import { buildContextFrame, readEasyEdaVersion } from './eda-context';
 import { runAction } from './actions';
+import { markLifecycle } from './lifecycle-timeline';
 import { createWebSocketId } from './transport-identity';
 import {
 	ActionError,
@@ -194,6 +195,11 @@ let connectionSessionId = 0;
 // spam the toast; reset only on a real outage (daemon-not-found retry branch) or
 // an explicit user reconnect/stop, so the NEXT genuine connect announces once.
 let connectionAnnounced = false;
+// Cold-start timeline sampling (issue #221): a periodic "the code is alive" marker
+// is what separates "bundle never evaluated" from "bundle runs but cannot reach the
+// daemon". Sampled, not per-second, so a long edit session cannot flood the log.
+let heartbeatAliveTicks = 0;
+let wakeEventCount = 0;
 
 // ─── Status ───────────────────────────────────────────────────────────
 
@@ -367,6 +373,7 @@ function cancelConnectionFlow(resetRetryCount = true): void {
  * Force a reconnect: cancel any active flow and retry the daemon port now.
  */
 export function reconnect(): void {
+	markLifecycle('MENU_RECONNECT');
 	eda.sys_Message.showToastMessage(eda.sys_I18n.text('Reconnecting...'));
 	connectionAnnounced = false;
 	suspended = false;
@@ -380,6 +387,7 @@ export function reconnect(): void {
  * @param showToast - whether to show a toast confirming the stop
  */
 export function stop(showToast = true): void {
+	markLifecycle('MENU_STOP', `showToast=${showToast}`);
 	connectionAnnounced = false;
 	suspended = true; // keep the watchdog from auto-reconnecting after an explicit stop
 	cancelConnectionFlow();
@@ -391,10 +399,18 @@ export function stop(showToast = true): void {
 /**
  * Start the connection flow if auto-connect is enabled.
  */
-export function start(): void {
+export function start(source: 'activate' | 'module-load' = 'activate'): void {
+	markLifecycle('TRANSPORT_START', `source=${source} autoConnect=${autoConnectEnabled()}`);
 	suspended = false;
 	startWatchdog(); // always-on background-immune reconnect driver
-	if (autoConnectEnabled()) {
+	// Idempotent kick. EasyEDA evaluates the extension bundle more than once in one
+	// process (field timeline 2026-09-21: twice, ~28s apart, on a single cold start),
+	// and each evaluation may call this. An unconditional scanAndConnect() would tear
+	// down a live socket and re-register the same wsId on every re-evaluation — the
+	// duplicate-registration race behind #196. Only kick when there is genuinely
+	// nothing in flight: `suspended` was just cleared, and the watchdog covers any
+	// retry the gate skips.
+	if (autoConnectEnabled() && !handshakeVerified && !isConnecting) {
 		void scanAndConnect();
 	}
 }
@@ -424,6 +440,7 @@ async function scanAndConnect(force = false): Promise<void> {
 	clearRetryTimer();
 	const ports = attemptPorts();
 	diag(`connect attempt session=${sessionId} ports=${ports.join(',')} retryCount=${retryCount} wsId=${wsId}`);
+	markLifecycle('CONNECT_ATTEMPT', `session=${sessionId} ports=${ports.join(',')} retry=${retryCount}`);
 
 	try {
 		for (const port of ports) {
@@ -458,6 +475,11 @@ async function scanAndConnect(force = false): Promise<void> {
 		}
 		// Daemon is genuinely gone — let the next successful connect announce again.
 		connectionAnnounced = false;
+		// Only the first failure of an outage is recorded: the retry loop is fast, and
+		// the timeline only needs "attempts happen and all failed", not every attempt.
+		if (retryCount === 1) {
+			markLifecycle('CONNECT_ATTEMPT_FAILED', `session=${sessionId} ports=${ports.join(',')} wsId=${wsId}`);
+		}
 		// Toast ONCE per outage (on the first failed attempt), then retry SILENTLY.
 		// Previously every fast retry toasted "(n/MAX)" on each retry — at a 3s
 		// cadence the toasts stacked and obscured the UI ("one starts before the
@@ -533,6 +555,7 @@ function tryConnectToPort(port: number, sessionId: number): Promise<boolean> {
 			timer = setTimeout(() => settle(false), CONNECTION_TIMEOUT_MS);
 			handshakeVerified = false;
 			diag(`register port=${port} session=${sessionId}`);
+			markLifecycle('REGISTER_CALLED', `port=${port} session=${sessionId} wsId=${wsId}`);
 
 			try {
 				eda.sys_WebSocket.register(
@@ -563,6 +586,7 @@ function tryConnectToPort(port: number, sessionId: number): Promise<boolean> {
 								handshakeVerified = true;
 								windowId = crypto.randomUUID();
 								lastContextSig = '';
+								markLifecycle('HANDSHAKE_OK', `port=${port} session=${sessionId}`);
 								sendRegister();
 								void sendContext(true);
 								if (!connectionAnnounced) {
@@ -575,6 +599,7 @@ function tryConnectToPort(port: number, sessionId: number): Promise<boolean> {
 							}
 							else {
 								console.warn(`[easyeda-agent] Unexpected handshake service "${(msg as { service?: string }).service}"`);
+								markLifecycle('HANDSHAKE_BAD_SERVICE', `port=${port} service=${String((msg as { service?: string }).service)}`);
 								settle(false);
 							}
 							return;
@@ -592,6 +617,7 @@ function tryConnectToPort(port: number, sessionId: number): Promise<boolean> {
 			catch (err) {
 				// register() throws when external-interaction permission is disabled.
 				console.error('[easyeda-agent] Failed to register WebSocket:', err);
+				markLifecycle('REGISTER_THREW', `port=${port} err=${describeThrown(err)}`);
 				settle(false);
 			}
 		};
@@ -758,6 +784,9 @@ function autoConnectEnabled(): boolean {
 
 function watchdogTick(): void {
 	watchdogTicks += 1;
+	// Sampled liveness marker: proves the always-on ticker is actually running in
+	// this editor process, independent of whether any daemon was ever reached.
+	heartbeatAliveTicks += 1;
 	// 保底触发所有到期的守卫(队列放弃闸 + 每次平台调用的 withTimeout)。
 	// **必须在最前面、且不受任何分支影响**:队首卡死与连接状态无关,而这条
 	// worker tick 是本进程里唯一被真机证明不受后台节流影响的时基
@@ -791,6 +820,11 @@ function watchdogTick(): void {
 	else if (!suspended && autoConnectEnabled()) {
 		void scanAndConnect();
 	}
+	// Every 10th tick (~30s) while never connected: the decisive "code is running
+	// but no daemon was reached" evidence for the #221 timeline.
+	if (!handshakeVerified && heartbeatAliveTicks % 10 === 0) {
+		markLifecycle('HEARTBEAT_ALIVE', `ticks=${heartbeatAliveTicks} suspended=${suspended} retry=${retryCount} connecting=${isConnecting}`);
+	}
 }
 
 function startWatchdog(): void {
@@ -812,10 +846,12 @@ function startWatchdog(): void {
 		watchdogWorker = new Worker(url);
 		watchdogWorker.onmessage = tick;
 		diag('watchdog: worker ticker started');
+		markLifecycle('WATCHDOG_STARTED', 'mode=worker');
 	}
 	catch {
 		diag('watchdog: worker unavailable — main-thread interval (throttled when backgrounded)');
 		setInterval(tick, HEARTBEAT_INTERVAL_MS);
+		markLifecycle('WATCHDOG_FALLBACK_INTERVAL', 'mode=main-thread');
 	}
 	// Belt-and-suspenders: recover immediately on window focus / network up — the
 	// main path for the setInterval-fallback case, and faster recovery generally.
@@ -834,9 +870,14 @@ function startWatchdog(): void {
 		void scanAndConnect(true);
 	};
 	try {
-		globalThis.addEventListener?.('focus', wake);
-		globalThis.addEventListener?.('online', wake);
-		globalThis.addEventListener?.('visibilitychange', wake);
+		const wakeName = (event: string) => (): void => {
+			wakeEventCount += 1;
+			markLifecycle('WAKE_EVENT', `event=${event} count=${wakeEventCount} verified=${handshakeVerified} suspended=${suspended}`);
+			wake();
+		};
+		globalThis.addEventListener?.('focus', wakeName('focus'));
+		globalThis.addEventListener?.('online', wakeName('online'));
+		globalThis.addEventListener?.('visibilitychange', wakeName('visibilitychange'));
 	}
 	catch { /* no addEventListener in this host — ignore */ }
 }

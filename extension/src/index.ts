@@ -17,8 +17,49 @@ import {
 	start as transportStart,
 	stop as transportStop,
 } from './transport';
+import {
+	dumpLifecycleTimeline,
+	markLifecycle,
+	markLifecycleOnce,
+	probeHost,
+	probeSandboxGlobals,
+} from './lifecycle-timeline';
 
 const STORAGE_KEY_AUTO_CONNECT = 'autoConnectEnabled';
+
+// ─── Cold-start evidence (issue #221) ─────────────────────────────────
+// The single fact that decides whether a connector-side fix is even possible:
+// did the host evaluate this bundle at all? Recorded unconditionally at module
+// scope, before activation, so absence of this marker is itself the answer.
+// See ./lifecycle-timeline for the full reasoning.
+markLifecycleOnce('ENTRY_MODULE_EVALUATED');
+markLifecycleOnce('SANDBOX_GLOBALS_PROBE', probeSandboxGlobals());
+
+// ─── Module-scope bootstrap (issue #221) ──────────────────────────────
+/**
+ * Start the transport HERE, not only from `activate()`.
+ *
+ * EasyEDA can evaluate a user-extension bundle without ever dispatching its
+ * activation event, which leaves `activate()` — and therefore the whole transport
+ * — unrun. Measured on Windows EasyEDA Pro 3.2.149.88089769, connector 1.5.3-dev.3,
+ * one cold start (2026-09-21):
+ *
+ *     10:50:16  ENTRY_MODULE_EVALUATED
+ *     10:50:16  SANDBOX_GLOBALS_PROBE eda=true storage=true toast=true ws=true doc=false
+ *     10:50:19  [project opened]
+ *     10:50:44  ENTRY_MODULE_EVALUATED
+ *     10:50:44  SANDBOX_GLOBALS_PROBE eda=true storage=true toast=true ws=true doc=false
+ *
+ * Two bundle evaluations, ZERO `ACTIVATE_CALLED`, zero `TRANSPORT_START`. The host
+ * never called `activate()`, so no watchdog was ever built and the daemon saw no
+ * connection attempt at all (it logged no TCP connect while the port stayed
+ * healthy — the "daemon-side zero attempts" symptom of #221).
+ *
+ * `activate()` is still called on the healthy path, so `start()` is written to be
+ * idempotent (see transport.start) and the two entry points cannot fight over the
+ * socket.
+ */
+transportStart('module-load');
 
 // ─── Lifecycle ────────────────────────────────────────────────────────
 
@@ -30,14 +71,27 @@ const STORAGE_KEY_AUTO_CONNECT = 'autoConnectEnabled';
  */
 // eslint-disable-next-line unused-imports/no-unused-vars
 export function activate(status?: 'onStartupFinished', arg?: string): void {
-	transportStart();
+	const host = probeHost();
+	markLifecycle('ACTIVATE_CALLED', `status=${status ?? 'none'} arg=${arg ?? ''} v=${host.editorVersion} doc=${host.documentType}`);
+	transportStart('activate');
 }
 
 /**
  * Extension deactivation: tear down the connection without showing a toast.
  */
 export function deactivate(): void {
+	markLifecycle('DEACTIVATE_CALLED');
 	transportStop(false);
+}
+
+/**
+ * Write the cold-start timeline into the editor log (menu item).
+ *
+ * Exists so the timeline is recoverable on a cold start where nothing connected
+ * and no action can travel over the (absent) daemon link.
+ */
+export function dumpLifecycle(): void {
+	dumpLifecycleTimeline();
 }
 
 // ─── Menu actions ─────────────────────────────────────────────────────
